@@ -4,7 +4,7 @@ set -e
 
 # Загрузка переменных из переменного окржуения для инициализации
 if [ -f .env ]; then
-    export $(cat -v '^#' .env | xargs)
+    export $(grep -v '^#' .env | xargs)
 else
     echo "Ошибка: не найден .env файл"
     exit 1

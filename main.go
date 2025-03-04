@@ -34,6 +34,7 @@ type PostResponse struct {
 }
 
 func main() {
+	// Загрузка переменных окружения
 	godotenv.Load()
 	dsn := "postgres://" + os.Getenv("DB_USER_NAME") + ":" + os.Getenv("DB_PASSWORD") +
 		"@" + os.Getenv("DB_HOST") + ":" + os.Getenv("DB_PORT") +
@@ -46,6 +47,7 @@ func main() {
 
 	router := mux.NewRouter()
 
+	// POST эндпоинт для загрузки данных (из первого коммита)
 	router.HandleFunc("/api/v0/prices", func(w http.ResponseWriter, r *http.Request) {
 		file, _, err := r.FormFile("file")
 		if err != nil {
@@ -76,7 +78,7 @@ func main() {
 				continue
 			}
 			csvReader := csv.NewReader(rc)
-			csvReader.Read()
+			csvReader.Read() // пропускаем заголовок
 			for {
 				rec, err := csvReader.Read()
 				if err == io.EOF {
@@ -120,6 +122,62 @@ func main() {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
 	}).Methods("POST")
+
+	// Новый GET эндпоинт для выгрузки данных
+	router.HandleFunc("/api/v0/prices", func(w http.ResponseWriter, r *http.Request) {
+		rows, err := db.Query("SELECT id, created_at, name, category, price FROM prices")
+		if err != nil {
+			http.Error(w, "Failed to retrieve data", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		var records []PriceData
+		for rows.Next() {
+			var id int
+			var created time.Time
+			var name, category string
+			var price float64
+			rows.Scan(&id, &created, &name, &category, &price)
+			records = append(records, PriceData{
+				ID:        strconv.Itoa(id),
+				CreatedAt: created,
+				Name:      name,
+				Category:  category,
+				Price:     price,
+			})
+		}
+
+		// Формирование CSV файла
+		buf := new(bytes.Buffer)
+		csvWriter := csv.NewWriter(buf)
+		csvWriter.Write([]string{"id", "name", "category", "price", "create_date"})
+		for _, p := range records {
+			csvWriter.Write([]string{
+				p.ID,
+				p.Name,
+				p.Category,
+				strconv.FormatFloat(p.Price, 'f', 2, 64),
+				p.CreatedAt.Format("2006-01-02"),
+			})
+		}
+		csvWriter.Flush()
+
+		// Упаковка CSV в zip-архив
+		zipBuf := new(bytes.Buffer)
+		zipWriter := zip.NewWriter(zipBuf)
+		f, err := zipWriter.Create("data.csv")
+		if err != nil {
+			http.Error(w, "Failed to create zip file", http.StatusInternalServerError)
+			return
+		}
+		f.Write(buf.Bytes())
+		zipWriter.Close()
+
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
+		w.Write(zipBuf.Bytes())
+	}).Methods("GET")
 
 	http.ListenAndServe(":"+os.Getenv("APP_PORT"), router)
 }

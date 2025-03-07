@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -33,44 +34,100 @@ type PostResponse struct {
 	TotalPrice      float64 `json:"total_price"`
 }
 
-func main() {
-	// Загрузка переменных окружения
-	godotenv.Load()
-	dsn := "postgres://" + os.Getenv("DB_USER_NAME") + ":" + os.Getenv("DB_PASSWORD") +
-		"@" + os.Getenv("DB_HOST") + ":" + os.Getenv("DB_PORT") +
-		"/" + os.Getenv("DB_NAME") + "?sslmode=" + os.Getenv("DB_SSL_MODE")
+func initializeDB(dsn string) (*sql.DB, error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	defer db.Close()
+	if err = db.Ping(); err != nil {
+		return nil, err
+	}
+	query := `
+  CREATE TABLE IF NOT EXISTS prices (
+   id SERIAL PRIMARY KEY,
+   created_at DATE NOT NULL,
+   name VARCHAR(255) NOT NULL,
+   category VARCHAR(255) NOT NULL,
+   price DECIMAL(10,2) NOT NULL
+  )
+ `
+	_, err = db.Exec(query)
+	return db, err
+}
 
-	router := mux.NewRouter()
+// parseCSVFileFromZip извлекает записи CSV из файла внутри zip-архива
+func parseCSVFileFromZip(zf *zip.File) ([]PriceData, error) {
+	f, err := zf.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
 
-	// POST эндпоинт для загрузки данных (из первого коммита)
-	router.HandleFunc("/api/v0/prices", func(w http.ResponseWriter, r *http.Request) {
+	csvReader := csv.NewReader(f)
+	// Пропускаем заголовок
+	if _, err := csvReader.Read(); err != nil {
+		return nil, err
+	}
+
+	var items []PriceData
+	for {
+		record, err := csvReader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			log.Printf("Ошибка чтения записи CSV: %v", err)
+			continue
+		}
+		if len(record) < 5 {
+			continue
+		}
+		price, err := strconv.ParseFloat(record[3], 64)
+		if err != nil {
+			log.Printf("Ошибка парсинга цены: %v", err)
+			continue
+		}
+		createdAt, err := time.Parse("2006-01-02", record[4])
+		if err != nil {
+			log.Printf("Ошибка парсинга даты: %v", err)
+			continue
+		}
+		item := PriceData{
+			ID:        record[0],
+			Name:      record[1],
+			Category:  record[2],
+			Price:     price,
+			CreatedAt: createdAt,
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+func handlePostPrices(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		file, _, err := r.FormFile("file")
 		if err != nil {
-			http.Error(w, "Failed to retrieve file", http.StatusBadRequest)
+			http.Error(w, "Не удалось получить файл", http.StatusBadRequest)
 			return
 		}
 		defer file.Close()
 
-		buf := new(bytes.Buffer)
-		if _, err := io.Copy(buf, file); err != nil {
-			http.Error(w, "Failed to read file", http.StatusInternalServerError)
+		zipBuffer := new(bytes.Buffer)
+		if _, err := io.Copy(zipBuffer, file); err != nil {
+			http.Error(w, "Ошибка чтения файла", http.StatusInternalServerError)
 			return
 		}
 
-		zipReader, err := zip.NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+		zipReader, err := zip.NewReader(bytes.NewReader(zipBuffer.Bytes()), int64(zipBuffer.Len()))
 		if err != nil {
-			http.Error(w, "Invalid zip file", http.StatusBadRequest)
+			http.Error(w, "Неверный формат zip-архива", http.StatusBadRequest)
 			return
 		}
 
 		var records []PriceData
 		for _, f := range zipReader.File {
-			if len(f.Name) < 4 || f.Name[len(f.Name)-4:] != ".csv" {
+			if filepath.Ext(f.Name) != ".csv" {
 				continue
 			}
 			rc, err := f.Open()
@@ -88,10 +145,10 @@ func main() {
 					continue
 				}
 				price, _ := strconv.ParseFloat(rec[3], 64)
-				date, _ := time.Parse("2006-01-02", rec[4])
+				createdAt, _ := time.Parse("2006-01-02", rec[4])
 				records = append(records, PriceData{
 					ID:        rec[0],
-					CreatedAt: date,
+					CreatedAt: createdAt,
 					Name:      rec[1],
 					Category:  rec[2],
 					Price:     price,
@@ -121,13 +178,14 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
-	}).Methods("POST")
+	}
+}
 
-	// Новый GET эндпоинт для выгрузки данных
-	router.HandleFunc("/api/v0/prices", func(w http.ResponseWriter, r *http.Request) {
+func handleGetPrices(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		rows, err := db.Query("SELECT id, created_at, name, category, price FROM prices")
 		if err != nil {
-			http.Error(w, "Failed to retrieve data", http.StatusInternalServerError)
+			http.Error(w, "Ошибка получения данных", http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
@@ -135,20 +193,22 @@ func main() {
 		var records []PriceData
 		for rows.Next() {
 			var id int
-			var created time.Time
+			var createdAt time.Time
 			var name, category string
 			var price float64
-			rows.Scan(&id, &created, &name, &category, &price)
+			if err := rows.Scan(&id, &createdAt, &name, &category, &price); err != nil {
+				log.Printf("Ошибка сканирования строки: %v", err)
+				continue
+			}
 			records = append(records, PriceData{
 				ID:        strconv.Itoa(id),
-				CreatedAt: created,
+				CreatedAt: createdAt,
 				Name:      name,
 				Category:  category,
 				Price:     price,
 			})
 		}
 
-		// Формирование CSV файла
 		buf := new(bytes.Buffer)
 		csvWriter := csv.NewWriter(buf)
 		csvWriter.Write([]string{"id", "name", "category", "price", "create_date"})
@@ -163,7 +223,6 @@ func main() {
 		}
 		csvWriter.Flush()
 
-		// Упаковка CSV в zip-архив
 		zipBuf := new(bytes.Buffer)
 		zipWriter := zip.NewWriter(zipBuf)
 		f, err := zipWriter.Create("data.csv")
@@ -177,7 +236,21 @@ func main() {
 		w.Header().Set("Content-Type", "application/zip")
 		w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
 		w.Write(zipBuf.Bytes())
-	}).Methods("GET")
+	}
+}
+
+func main() {
+	godotenv.Load()
+	dsn := "postgres://" + os.Getenv("DB_USER_NAME") + ":" + os.Getenv("DB_PASSWORD") + "@" + os.Getenv("DB_HOST") + ":" + os.Getenv("DB_PORT") + "/" + os.Getenv("DB_NAME") + "?sslmode=" + os.Getenv("DB_SSL_MODE")
+	db, err := initializeDB(dsn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	router := mux.NewRouter()
+	router.HandleFunc("/api/v0/prices", handlePostPrices(db)).Methods("POST")
+	router.HandleFunc("/api/v0/prices", handleGetPrices(db)).Methods("GET")
 
 	http.ListenAndServe(":"+os.Getenv("APP_PORT"), router)
 }

@@ -22,3 +22,10 @@ else
   echo "Ошибка: не удалась сборка приложения" 
   exit 1
 fi
+
+if nohup ./app > output.log 2>&1 & then
+  NW_PID=$!  echo "Приложение запущено с PID: $NW_PID"
+else  
+  echo "Ошибка: не удалось запустить приложение."
+  exit 1
+fi

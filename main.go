@@ -42,20 +42,9 @@ func initializeDB(dsn string) (*sql.DB, error) {
 	if err = db.Ping(); err != nil {
 		return nil, err
 	}
-	query := `
-  CREATE TABLE IF NOT EXISTS prices (
-   id SERIAL PRIMARY KEY,
-   created_at DATE NOT NULL,
-   name VARCHAR(255) NOT NULL,
-   category VARCHAR(255) NOT NULL,
-   price DECIMAL(10,2) NOT NULL
-  )
- `
-	_, err = db.Exec(query)
-	return db, err
+	return db, nil
 }
 
-// parseCSVFileFromZip извлекает записи CSV из файла внутри zip-архива
 func parseCSVFileFromZip(zf *zip.File) ([]PriceData, error) {
 	f, err := zf.Open()
 	if err != nil {
@@ -64,7 +53,6 @@ func parseCSVFileFromZip(zf *zip.File) ([]PriceData, error) {
 	defer f.Close()
 
 	csvReader := csv.NewReader(f)
-	// Пропускаем заголовок
 	if _, err := csvReader.Read(); err != nil {
 		return nil, err
 	}
@@ -76,7 +64,7 @@ func parseCSVFileFromZip(zf *zip.File) ([]PriceData, error) {
 			break
 		}
 		if err != nil {
-			log.Printf("Ошибка чтения записи CSV: %v", err)
+			log.Printf("CSV read error: %v", err)
 			continue
 		}
 		if len(record) < 5 {
@@ -84,12 +72,12 @@ func parseCSVFileFromZip(zf *zip.File) ([]PriceData, error) {
 		}
 		price, err := strconv.ParseFloat(record[3], 64)
 		if err != nil {
-			log.Printf("Ошибка парсинга цены: %v", err)
+			log.Printf("Price parse error: %v", err)
 			continue
 		}
 		createdAt, err := time.Parse("2006-01-02", record[4])
 		if err != nil {
-			log.Printf("Ошибка парсинга даты: %v", err)
+			log.Printf("Date parse error: %v", err)
 			continue
 		}
 		item := PriceData{
@@ -108,20 +96,20 @@ func handlePostPrices(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		file, _, err := r.FormFile("file")
 		if err != nil {
-			http.Error(w, "Не удалось получить файл", http.StatusBadRequest)
+			http.Error(w, "Failed to retrieve file", http.StatusBadRequest)
 			return
 		}
 		defer file.Close()
 
 		zipBuffer := new(bytes.Buffer)
 		if _, err := io.Copy(zipBuffer, file); err != nil {
-			http.Error(w, "Ошибка чтения файла", http.StatusInternalServerError)
+			http.Error(w, "File read error", http.StatusInternalServerError)
 			return
 		}
 
 		zipReader, err := zip.NewReader(bytes.NewReader(zipBuffer.Bytes()), int64(zipBuffer.Len()))
 		if err != nil {
-			http.Error(w, "Неверный формат zip-архива", http.StatusBadRequest)
+			http.Error(w, "Invalid zip file", http.StatusBadRequest)
 			return
 		}
 
@@ -130,31 +118,12 @@ func handlePostPrices(db *sql.DB) http.HandlerFunc {
 			if filepath.Ext(f.Name) != ".csv" {
 				continue
 			}
-			rc, err := f.Open()
+			csvRecords, err := parseCSVFileFromZip(f)
 			if err != nil {
+				log.Printf("Error parsing %s: %v", f.Name, err)
 				continue
 			}
-			csvReader := csv.NewReader(rc)
-			csvReader.Read() // пропускаем заголовок
-			for {
-				rec, err := csvReader.Read()
-				if err == io.EOF {
-					break
-				}
-				if len(rec) < 5 {
-					continue
-				}
-				price, _ := strconv.ParseFloat(rec[3], 64)
-				createdAt, _ := time.Parse("2006-01-02", rec[4])
-				records = append(records, PriceData{
-					ID:        rec[0],
-					CreatedAt: createdAt,
-					Name:      rec[1],
-					Category:  rec[2],
-					Price:     price,
-				})
-			}
-			rc.Close()
+			records = append(records, csvRecords...)
 		}
 
 		processed := 0
@@ -185,7 +154,7 @@ func handleGetPrices(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rows, err := db.Query("SELECT id, created_at, name, category, price FROM prices")
 		if err != nil {
-			http.Error(w, "Ошибка получения данных", http.StatusInternalServerError)
+			http.Error(w, "Data retrieval error", http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
@@ -197,7 +166,7 @@ func handleGetPrices(db *sql.DB) http.HandlerFunc {
 			var name, category string
 			var price float64
 			if err := rows.Scan(&id, &createdAt, &name, &category, &price); err != nil {
-				log.Printf("Ошибка сканирования строки: %v", err)
+				log.Printf("Row scan error: %v", err)
 				continue
 			}
 			records = append(records, PriceData{
@@ -227,7 +196,7 @@ func handleGetPrices(db *sql.DB) http.HandlerFunc {
 		zipWriter := zip.NewWriter(zipBuf)
 		f, err := zipWriter.Create("data.csv")
 		if err != nil {
-			http.Error(w, "Failed to create zip file", http.StatusInternalServerError)
+			http.Error(w, "Zip file creation error", http.StatusInternalServerError)
 			return
 		}
 		f.Write(buf.Bytes())
@@ -241,7 +210,9 @@ func handleGetPrices(db *sql.DB) http.HandlerFunc {
 
 func main() {
 	godotenv.Load()
-	dsn := "postgres://" + os.Getenv("DB_USER_NAME") + ":" + os.Getenv("DB_PASSWORD") + "@" + os.Getenv("DB_HOST") + ":" + os.Getenv("DB_PORT") + "/" + os.Getenv("DB_NAME") + "?sslmode=" + os.Getenv("DB_SSL_MODE")
+	dsn := "postgres://" + os.Getenv("DB_USER_NAME") + ":" + os.Getenv("DB_PASSWORD") +
+		"@" + os.Getenv("DB_HOST") + ":" + os.Getenv("DB_PORT") +
+		"/" + os.Getenv("DB_NAME") + "?sslmode=" + os.Getenv("DB_SSL_MODE")
 	db, err := initializeDB(dsn)
 	if err != nil {
 		log.Fatal(err)
@@ -251,6 +222,5 @@ func main() {
 	router := mux.NewRouter()
 	router.HandleFunc("/api/v0/prices", handlePostPrices(db)).Methods("POST")
 	router.HandleFunc("/api/v0/prices", handleGetPrices(db)).Methods("GET")
-
 	http.ListenAndServe(":"+os.Getenv("APP_PORT"), router)
 }

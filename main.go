@@ -126,19 +126,44 @@ func handlePostPrices(db *sql.DB) http.HandlerFunc {
 			records = append(records, csvRecords...)
 		}
 
+		tx, err := db.Begin()
+		if err != nil {
+			http.Error(w, "Failed to begin transaction", http.StatusInternalServerError)
+			return
+		}
+
+		stmt, err := tx.Prepare("INSERT INTO prices (created_at, name, category, price) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING")
+		if err != nil {
+			tx.Rollback()
+			http.Error(w, "Failed to prepare statement", http.StatusInternalServerError)
+			return
+		}
+		defer stmt.Close()
+
 		processed := 0
 		for _, rec := range records {
-			_, err := db.Exec("INSERT INTO prices (id, created_at, name, category, price) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-				rec.ID, rec.CreatedAt, rec.Name, rec.Category, rec.Price)
-			if err == nil {
-				processed++
+			_, err := stmt.Exec(rec.CreatedAt, rec.Name, rec.Category, rec.Price)
+			if err != nil {
+				tx.Rollback()
+				http.Error(w, "Error inserting record", http.StatusInternalServerError)
+				return
 			}
+			processed++
 		}
 
 		var catCount int
 		var totalPrice float64
-		row := db.QueryRow("SELECT COUNT(DISTINCT category), COALESCE(SUM(price),0) FROM prices")
-		row.Scan(&catCount, &totalPrice)
+		row := tx.QueryRow("SELECT COUNT(DISTINCT category), COALESCE(SUM(price), 0) FROM prices")
+		if err := row.Scan(&catCount, &totalPrice); err != nil {
+			tx.Rollback()
+			http.Error(w, "Error calculating totals", http.StatusInternalServerError)
+			return
+		}
+
+		if err := tx.Commit(); err != nil {
+			http.Error(w, "Transaction commit error", http.StatusInternalServerError)
+			return
+		}
 
 		resp := PostResponse{
 			TotalItems:      processed,
@@ -176,6 +201,10 @@ func handleGetPrices(db *sql.DB) http.HandlerFunc {
 				Category:  category,
 				Price:     price,
 			})
+		}
+		if err := rows.Err(); err != nil {
+			http.Error(w, "Row iteration error", http.StatusInternalServerError)
+			return
 		}
 
 		buf := new(bytes.Buffer)

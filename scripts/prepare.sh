@@ -22,7 +22,7 @@ echo "Создание таблицы $DB_TABLE_NAMEE в базе данных $
 PGPASSWORD=$DB_PASSWORD psql -U $DB_USER_NAME -h $DB_HOST -p $DB_PORT -d $DB_NAME -c "
 CREATE TABLE IF NOT EXISTS $DB_TABLE_NAME (
     id SERIAL PRIMARY KEY,           -- Автоматически увеличиваемый идентификатор
-    created_at DATE NOT NULL,        -- Дата создания продукта
+    created_at TIMESTAMP NOT NULL,        -- Дата создания продукта
     name VARCHAR(255) NOT NULL,      -- Название продукта
     category VARCHAR(255) NOT NULL,  -- Категория продукта
     price DECIMAL(10, 2) NOT NULL    -- Цена продукта с точностью до 2 знаков после запятой
